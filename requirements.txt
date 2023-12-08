@@ -3,4 +3,5 @@ stqdm
 openai
 loguru
 aiohttp
+requests
 streamlit

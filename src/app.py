@@ -3,18 +3,19 @@ import io
 import av
 import base64
 import asyncio
+import requests
 import pandas as pd
 from utils import *
 import streamlit as st
 from stqdm import stqdm
 from pathlib import Path
-from aiohttp import FormData
 from datetime import datetime
 from openai import AsyncOpenAI
 
 UTC_TIMESTAMP = int(datetime.utcnow().timestamp())
 
 client = AsyncOpenAI()
+
 
 @st.cache_data(show_spinner=False)
 def extract_audio(video_file):
@@ -40,6 +41,7 @@ def extract_audio(video_file):
     audio_buffer.seek(0)
     return audio_buffer
 
+
 @st.cache_data(show_spinner=False)
 def build_voices_dataframe(
     voices: dict
@@ -51,10 +53,12 @@ def build_voices_dataframe(
         voice.pop("fine_tuning")
     return pd.DataFrame(voices_copy.values())[["name", "category", "age", "gender", "accent", "description", "use case"]].set_index("name")
 
+
 @retry(stop=stop_after_attempt(RETRIES), wait=wait_exponential(multiplier=BACKOFF, min=DELAY), reraise=True, retry_error_callback=logger.error)
 async def recognize_speech(
     audio: io.BytesIO
 ) -> str:
+    return "TEST"
     if "RECOGNIZED_TEXT" in st.session_state:
         return st.session_state["RECOGNIZED_TEXT"]
     
@@ -73,6 +77,7 @@ async def recognize_speech(
     except:
         transcript = transcript["text"] if "text" in transcript else transcript
     return transcript
+
 
 @retry(stop=stop_after_attempt(RETRIES), wait=wait_exponential(multiplier=BACKOFF, min=DELAY), reraise=True, retry_error_callback=logger.error)
 async def translate_text(
@@ -94,6 +99,7 @@ async def translate_text(
     )
     return response.choices[0].message.content.strip()
 
+
 async def get_voices():
     # Get a list of currently available voices
     url = "https://api.elevenlabs.io/v1/voices"
@@ -101,11 +107,13 @@ async def get_voices():
         "xi-api-key": os.getenv("ELEVEN_API_KEY"),
     }
     voice_list = []
-    async for voices in call_api("GET", url, headers=headers):
-        voice_list.extend(voices["voices"])
+    async for response in call_api("GET", url, headers=headers):
+        voice_list.extend(response["voices"])
     voices = {voice["name"]: voice for voice in voice_list}
     return voices
 
+
+@retry(stop=stop_after_attempt(RETRIES), wait=wait_exponential(multiplier=BACKOFF, min=DELAY), reraise=True, retry_error_callback=logger.error)
 async def create_voice_clone(
     name: str,
     description: str,
@@ -116,17 +124,25 @@ async def create_voice_clone(
     headers = {
         "xi-api-key": os.getenv("ELEVEN_API_KEY"),
     }
-    form_data = FormData()
-    form_data.add_field("name", name)
-    form_data.add_field("description", description)
-    form_data.add_field("file", audio, filename="audio.mp3", content_type="audio/mpeg")
-    async for response in call_api("POST", url, headers=headers, data=form_data):
-        return response["voice_id"]
-    
+    # Convert the input audio into an UploadFile object
+    data = {
+        "name": name,
+        "description": description,
+    }
+    files = [
+        ("files", ("audio.mp3", audio, "audio/mpeg"))
+    ]
+    response = requests.request("POST", url, headers=headers, data=data, files=files)
+    if response.status_code != 200:
+        raise RuntimeError(f"API call failed with status {response.status_code}: {response.text}")
+    return response.json()["voice_id"]
+
+
+@retry(stop=stop_after_attempt(RETRIES), wait=wait_exponential(multiplier=BACKOFF, min=DELAY), reraise=True, retry_error_callback=logger.error)
 async def generate_voice(
     voice_id: str,
     text: str,
-) -> io.BytesIO:
+) -> bytes:
     if "GENERATED_AUDIO" in st.session_state:
         return st.session_state["GENERATED_AUDIO"]
     
@@ -140,10 +156,9 @@ async def generate_voice(
         "text": text,
     }
     async for response in call_api("POST", url, headers=headers, data=data):
-        audio = io.BytesIO()
-        audio.write(response)
-        audio.seek(0)
-        return audio
+        audio = response
+    return audio
+
 
 def create_download_link(data, filename):
     if isinstance(data, bytes):
@@ -153,6 +168,21 @@ def create_download_link(data, filename):
     ext = Path(filename).suffix[1:]
     href = f'<a href="data:file/{ext};base64,{b64}" download="{filename}">Download as {ext} file</a>'
     return href
+
+
+def reset_session_state():
+    if "RECOGNIZED_TEXT" in st.session_state:
+        del st.session_state["RECOGNIZED_TEXT"]
+    if "TRANSLATED_TEXT" in st.session_state:
+        del st.session_state["TRANSLATED_TEXT"]
+    if "GENERATED_AUDIO" in st.session_state:
+        del st.session_state["GENERATED_AUDIO"]
+
+
+############
+### MAIN ###
+############
+
 
 async def main():
     st.set_page_config(
@@ -174,10 +204,8 @@ async def main():
     if st.button("Clear Cache"):
         st.cache_data.clear()
         st.cache_resource.clear()
-        if "RECOGNIZED_TEXT" in st.session_state:
-            del st.session_state["RECOGNIZED_TEXT"]
-        if "TRANSLATED_TEXT" in st.session_state:
-            del st.session_state["TRANSLATED_TEXT"]
+        reset_session_state()
+
     step_1 = st.container(border=True)
     with step_1:
         st.write("**Step 1: Upload a (mp4) video**")
@@ -185,10 +213,7 @@ async def main():
 
     if uploaded_file is None:
         # No file has been uploaded, clear any downstream session_state items
-        if "RECOGNIZED_TEXT" in st.session_state:
-            del st.session_state["RECOGNIZED_TEXT"]
-        if "TRANSLATED_TEXT" in st.session_state:
-            del st.session_state["TRANSLATED_TEXT"]
+        reset_session_state()
         st.stop()
 
     if "UPLOADED_FILE" not in st.session_state:
@@ -196,8 +221,7 @@ async def main():
     
     if "UPLOADED_FILE" in st.session_state and st.session_state["UPLOADED_FILE"] != uploaded_file.name:
         # A different file has been uploaded, clear any downstream session_state items
-        del st.session_state["RECOGNIZED_TEXT"]
-        del st.session_state["TRANSLATED_TEXT"]
+        reset_session_state()
 
     with step_1:
         with st.expander("Preview Video"):
@@ -215,13 +239,13 @@ async def main():
         st.stop()
 
     tasks = [get_voices(), recognize_speech(audio)]
-    with st.spinner("Recognizing speech..."):
+    with st.spinner("Loading..."):
         voices, recognized_text = await asyncio.gather(*tasks)
 
     if "RECOGNIZED_TEXT" not in st.session_state:
         st.session_state["RECOGNIZED_TEXT"] = recognized_text
 
-    step_3 = st.expander("**Step 3 (Optional): Create a Voice Clone with [ElevenLabs](https://elevenlabs.io)**", expanded=False)
+    step_3 = st.expander("**Step 3 (Optional): Create a Voice Clone**", expanded=False)
     with step_3:
         st.dataframe(build_voices_dataframe(voices), use_container_width=True, height=200)
         voice_name = st.selectbox("Select a voice to hear a preview", list(voices.keys()), index=None)
@@ -239,7 +263,7 @@ async def main():
             submit_voice_clone = st.form_submit_button("Submit")
         if submit_voice_clone:
             with st.spinner("Creating voice clone..."):
-                voice_id = await create_voice_clone(name, description, audio)
+                st.session_state["VOICE_CLONE_ID"] = await create_voice_clone(name, description, audio)
             
     step_4 = st.container(border=True)
     with step_4:
@@ -257,6 +281,8 @@ async def main():
         st.session_state["RECOGNIZED_TEXT"] = src_text
         if "TRANSLATED_TEXT" in st.session_state:
             del st.session_state["TRANSLATED_TEXT"]
+        if "GENERATED_AUDIO" in st.session_state:
+            del st.session_state["GENERATED_AUDIO"]
 
     with st.spinner("Translating text..."):
         translated_text = await translate_text(src_text, dst_lang)
@@ -266,7 +292,7 @@ async def main():
 
     step_5 = st.container(border=True)
     with step_5:
-        st.write("**Step 5: Generate translated audio track with [ElevenLabs](https://elevenlabs.io)**")
+        st.write("**Step 5: Generate translated audio track with**")
         with st.form("Edit for voice generation"):
             dst_text = st.text_area("Translated text", st.session_state["TRANSLATED_TEXT"])
             voice_name = st.selectbox("Select a voice", list(voices.keys()), index=None)
@@ -303,6 +329,10 @@ async def main():
             ),
             unsafe_allow_html=True
         )
+        submit_lip_syncing = st.button("Submit to Lip Syncing")
+    
+    if not submit_lip_syncing:
+        st.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -36,4 +36,7 @@ async def call_api(
                     chunk = line.decode("utf-8").strip()
                     yield chunk
             else:
-                yield await resp.json()
+                if resp.headers["Content-Type"] == "application/json":
+                    yield await resp.json()
+                else:
+                    yield await resp.content.read()
