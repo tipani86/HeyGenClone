@@ -1,13 +1,18 @@
 import os
 import io
 import av
+import base64
 import asyncio
 import pandas as pd
 from utils import *
 import streamlit as st
 from stqdm import stqdm
+from pathlib import Path
 from aiohttp import FormData
+from datetime import datetime
 from openai import AsyncOpenAI
+
+UTC_TIMESTAMP = int(datetime.utcnow().timestamp())
 
 client = AsyncOpenAI()
 
@@ -114,11 +119,40 @@ async def create_voice_clone(
     form_data = FormData()
     form_data.add_field("name", name)
     form_data.add_field("description", description)
-    files = []
-    files.append({"file": audio.getvalue()})
-    form_data.add_field("files", files)
+    form_data.add_field("file", audio, filename="audio.mp3", content_type="audio/mpeg")
     async for response in call_api("POST", url, headers=headers, data=form_data):
         return response["voice_id"]
+    
+async def generate_voice(
+    voice_id: str,
+    text: str,
+) -> io.BytesIO:
+    if "GENERATED_AUDIO" in st.session_state:
+        return st.session_state["GENERATED_AUDIO"]
+    
+    # Generate a spoken speech audio file (in memory) from a text string
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": os.getenv("ELEVEN_API_KEY"),
+    }
+    data = {
+        "model_id": "eleven_multilingual_v2",
+        "text": text,
+    }
+    async for response in call_api("POST", url, headers=headers, data=data):
+        audio = io.BytesIO()
+        audio.write(response)
+        audio.seek(0)
+        return audio
+
+def create_download_link(data, filename):
+    if isinstance(data, bytes):
+        b64 = base64.b64encode(data).decode()
+    else:
+        b64 = base64.b64encode(data.encode()).decode()
+    ext = Path(filename).suffix[1:]
+    href = f'<a href="data:file/{ext};base64,{b64}" download="{filename}">Download as {ext} file</a>'
+    return href
 
 async def main():
     st.set_page_config(
@@ -140,12 +174,21 @@ async def main():
     if st.button("Clear Cache"):
         st.cache_data.clear()
         st.cache_resource.clear()
+        if "RECOGNIZED_TEXT" in st.session_state:
+            del st.session_state["RECOGNIZED_TEXT"]
+        if "TRANSLATED_TEXT" in st.session_state:
+            del st.session_state["TRANSLATED_TEXT"]
     step_1 = st.container(border=True)
     with step_1:
         st.write("**Step 1: Upload a (mp4) video**")
         uploaded_file = st.file_uploader("Choose a video...", type=["mp4"])
 
     if uploaded_file is None:
+        # No file has been uploaded, clear any downstream session_state items
+        if "RECOGNIZED_TEXT" in st.session_state:
+            del st.session_state["RECOGNIZED_TEXT"]
+        if "TRANSLATED_TEXT" in st.session_state:
+            del st.session_state["TRANSLATED_TEXT"]
         st.stop()
 
     if "UPLOADED_FILE" not in st.session_state:
@@ -178,7 +221,7 @@ async def main():
     if "RECOGNIZED_TEXT" not in st.session_state:
         st.session_state["RECOGNIZED_TEXT"] = recognized_text
 
-    step_3 = st.expander("**Step 3 (Optional): Create a Voice Clone with Elevenlabs**", expanded=False)
+    step_3 = st.expander("**Step 3 (Optional): Create a Voice Clone with [ElevenLabs](https://elevenlabs.io)**", expanded=False)
     with step_3:
         st.dataframe(build_voices_dataframe(voices), use_container_width=True, height=200)
         voice_name = st.selectbox("Select a voice to hear a preview", list(voices.keys()), index=None)
@@ -212,7 +255,8 @@ async def main():
     if src_text != st.session_state["RECOGNIZED_TEXT"]:
         # User has edited the recognized text, update it and clear any downstream session_state items
         st.session_state["RECOGNIZED_TEXT"] = src_text
-        del st.session_state["TRANSLATED_TEXT"]
+        if "TRANSLATED_TEXT" in st.session_state:
+            del st.session_state["TRANSLATED_TEXT"]
 
     with st.spinner("Translating text..."):
         translated_text = await translate_text(src_text, dst_lang)
@@ -222,15 +266,43 @@ async def main():
 
     step_5 = st.container(border=True)
     with step_5:
-        st.write("**Step 5: Generate translated audio track**")
+        st.write("**Step 5: Generate translated audio track with [ElevenLabs](https://elevenlabs.io)**")
         with st.form("Edit for voice generation"):
-            st.text_area("Translated text", st.session_state["TRANSLATED_TEXT"])
+            dst_text = st.text_area("Translated text", st.session_state["TRANSLATED_TEXT"])
             voice_name = st.selectbox("Select a voice", list(voices.keys()), index=None)
             submit_voice_generation = st.form_submit_button("Submit")
         
-        if submit_voice_generation:
-            pass
+    if "GENERATED_AUDIO" not in st.session_state and not submit_voice_generation:
+        st.stop()
+    
+    if dst_text != st.session_state["TRANSLATED_TEXT"]:
+        # User has edited the translated text, update it and clear any downstream session_state items
+        st.session_state["TRANSLATED_TEXT"] = dst_text
+        if "GENERATED_AUDIO" in st.session_state:
+            del st.session_state["GENERATED_AUDIO"]
 
+    with st.spinner("Generating audio..."):
+        audio = await generate_voice(voices[voice_name]["voice_id"], translated_text)
+    
+    if "GENERATED_AUDIO" not in st.session_state:
+        st.session_state["GENERATED_AUDIO"] = {
+            "audio": audio,
+            "name": voice_name,
+            "timestamp": UTC_TIMESTAMP,
+        }
+
+    step_6 = st.container(border=True)
+    with step_6:
+        st.write("**Step 6: Preview translated audio track**")
+        with st.expander("Preview Audio"):
+            st.audio(st.session_state["GENERATED_AUDIO"]["audio"], format="audio/mp3")
+        st.markdown(
+            create_download_link(
+                st.session_state["GENERATED_AUDIO"]["audio"],
+                f'generated_voice_{st.session_state["GENERATED_AUDIO"]["name"]}_{st.session_state["GENERATED_AUDIO"]["timestamp"]}.mp3',
+            ),
+            unsafe_allow_html=True
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())

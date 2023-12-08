@@ -1,2 +1,5 @@
 .venv
 devenv*
+__pycache__*
+*.mp3
+*.mp4
