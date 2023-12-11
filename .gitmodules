@@ -1,3 +1,0 @@
-[submodule "src/Wav2Lip"]
-	path = src/Wav2Lip
-	url = git@github.com:Rudrabha/Wav2Lip.git

@@ -3,4 +3,5 @@ __pycache__
 devenv*
 *.mp3
 *.mp4
+*.wav
 *.pyc
